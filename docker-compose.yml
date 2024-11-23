@@ -1,0 +1,47 @@
+services:
+  master:
+    build:
+      context: .
+      dockerfile: master.Dockerfile
+    container_name: master
+    networks:
+      app-network:
+        ipv4_address: 172.16.238.10
+    depends_on:
+      - worker1
+      - worker2
+      - worker3
+
+  worker1:
+    build:
+      context: .
+      dockerfile: worker.Dockerfile
+    container_name: worker1
+    networks:
+      app-network:
+        ipv4_address: 172.16.238.11
+
+  worker2:
+    build:
+      context: .
+      dockerfile: worker.Dockerfile
+    container_name: worker2
+    networks:
+      app-network:
+        ipv4_address: 172.16.238.12
+
+  worker3:
+    build:
+      context: .
+      dockerfile: worker.Dockerfile
+    container_name: worker3
+    networks:
+      app-network:
+        ipv4_address: 172.16.238.13
+
+networks:
+  app-network:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.16.238.0/24
