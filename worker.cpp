@@ -13,6 +13,7 @@ double compute_integral(double a, double b) {
     for (int i = 0; i < n; ++i) {
         s += function(a + i * h) * h;
     }
+    sleep(2);
     return s;
 }
 

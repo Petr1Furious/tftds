@@ -55,14 +55,39 @@ public:
         }
 
         int keepalive = 1;
-        setsockopt(sockfd, SOL_SOCKET, SO_KEEPALIVE, &keepalive, sizeof(keepalive));
+        if (setsockopt(sockfd, SOL_SOCKET, SO_KEEPALIVE, &keepalive, sizeof(keepalive)) < 0) {
+            std::cerr << "Failed to set SO_KEEPALIVE, error: " << strerror(errno) << std::endl;
+            close_socket();
+            return false;
+        }
+
+        int keepidle = 10;
+        if (setsockopt(sockfd, IPPROTO_TCP, TCP_KEEPIDLE, &keepidle, sizeof(keepidle)) < 0) {
+            std::cerr << "Failed to set TCP_KEEPIDLE, error: " << strerror(errno) << std::endl;
+            close_socket();
+            return false;
+        }
+
+        int keepintvl = 5;
+        if (setsockopt(sockfd, IPPROTO_TCP, TCP_KEEPINTVL, &keepintvl, sizeof(keepintvl)) < 0) {
+            std::cerr << "Failed to set TCP_KEEPINTVL, error: " << strerror(errno) << std::endl;
+            close_socket();
+            return false;
+        }
+
+        int keepcnt = 3;
+        if (setsockopt(sockfd, IPPROTO_TCP, TCP_KEEPCNT, &keepcnt, sizeof(keepcnt)) < 0) {
+            std::cerr << "Failed to set TCP_KEEPCNT, error: " << strerror(errno) << std::endl;
+            close_socket();
+            return false;
+        }
+
         set_nonblocking(sockfd);
 
         addr.sin_port = htons(WORKER_PORT);
         if (connect(sockfd, (sockaddr *)&addr, sizeof(addr)) < 0 && errno != EINPROGRESS) {
             std::cerr << "Failed to connect to worker, error: " << strerror(errno) << std::endl;
-            close(sockfd);
-            sockfd = -1;
+            close_socket();
             return false;
         }
 
@@ -75,12 +100,14 @@ public:
             std::cout << "Sent task " << segment_id << " to worker " << sockfd << std::endl;
             available = false;
             return true;
+        } else if (sent < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
+            std::cerr << "Failed to send task " << segment_id << " to worker " << sockfd << " (error: " << strerror(errno) << ")" << std::endl;
         }
-        std::cerr << "Failed to send task " << segment_id << " to worker " << sockfd << std::endl;
+        std::cerr << "Failed to send task " << segment_id << " to worker " << sockfd << " (error: " << strerror(errno) << ")" << std::endl;
         return false;
     }
 
-    bool receive_result(int &segment_id, double &result) {
+    bool receive_result(int &segment_id, double &result, bool &disconnect) {
         struct {
             int segment_id;
             double value;
@@ -91,6 +118,8 @@ public:
             result = res.value;
             available = true;
             return true;
+        } else if (received == 0 || (received < 0 && errno != EAGAIN && errno != EWOULDBLOCK)) {
+            disconnect = true;
         }
         return false;
     }
@@ -125,6 +154,7 @@ public:
     }
 
     void close_socket() {
+        available = false;
         close(sockfd);
         sockfd = -1;
     }
@@ -154,6 +184,7 @@ public:
 };
 
 void disconnect_client(Worker& worker, std::queue<int>& segment_queue, std::unordered_map<int, int>& worker_to_segment) {
+    std::cout << "Disconnecting worker " << worker.get_sockfd() << std::endl;
     auto it = worker_to_segment.find(worker.get_sockfd());
     if (it != worker_to_segment.end()) {
         int segment_id = it->second;
@@ -240,12 +271,16 @@ int main() {
                 if (fds[i].revents & POLLIN) {
                     int segment_id;
                     double result_value;
-                    if (workers[i].receive_result(segment_id, result_value)) {
+                    bool disconnect = false;
+                    if (workers[i].receive_result(segment_id, result_value, disconnect)) {
                         std::cout << "Received result for segment " << segment_id << " from worker " << workers[i].get_sockfd() << std::endl;
                         answer.add_segment(segment_id, result_value);
                         worker_to_segment.erase(workers[i].get_sockfd());
                     } else {
                         std::cerr << "Failed to receive result from worker " << workers[i].get_sockfd() << std::endl;
+                        if (disconnect) {
+                            disconnect_client(workers[i], segment_queue, worker_to_segment);
+                        }
                     }
                 } else if (fds[i].revents & (POLLHUP | POLLERR)) {
                     std::cerr << "Worker " << workers[i].get_sockfd() << " disconnected" << std::endl;
@@ -261,16 +296,6 @@ int main() {
                 }
 
                 if (workers[i].is_available() && !segment_queue.empty()) {
-                    if (workers[i].is_disconnected()) {
-                        std::cerr << "Worker " << workers[i].get_sockfd() << " disconnected" << std::endl;
-                        if (workers[i].get_sockfd() != -1) {
-                            workers[i].close_socket();
-                        }
-                        if (!workers[i].initialize_socket()) {
-                            continue;
-                        }
-                    }
-
                     int segment_id = segment_queue.front();
                     if (workers[i].send_task(segment_id)) {
                         segment_queue.pop();
