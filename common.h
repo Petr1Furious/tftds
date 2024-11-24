@@ -7,6 +7,8 @@
 #define N_SEGMENTS 100
 #define SEGMENT_START 0.0
 #define SEGMENT_END M_PI
+#define BROADCAST_ATTEMPTS 10
+#define BROADCAST_INTERVAL_MILLIS 100000
 
 double function(double x) {
     return sin(x);

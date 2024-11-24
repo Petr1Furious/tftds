@@ -1,6 +1,7 @@
 #include <iostream>
-#include <vector>
+#include <netinet/in.h>
 #include <unordered_map>
+#include <vector>
 #include <unordered_set>
 #include <queue>
 #include <cstring>
@@ -9,48 +10,151 @@
 #include <poll.h>
 #include <netinet/tcp.h>
 
+#ifndef SOCK_NONBLOCK
+#include <fcntl.h>
+#define SOCK_NONBLOCK O_NONBLOCK
+#endif
+
+#ifndef TCP_KEEPIDLE
+#define TCP_KEEPIDLE TCP_KEEPALIVE
+#endif
+
 #include "common.h"
 
 #define MAX_FDS 1024
+#define RECONNECT_INTERVAL 5
+#define POLL_TIMEOUT 1000
 
-class Worker {
-    int sockfd;
-    sockaddr_in addr;
-    bool available;
+class Answer {
+    double value;
+    std::unordered_set<int> completed_segments;
 
 public:
-    Worker(sockaddr_in address)
-        : sockfd(-1), addr(address), available(true) {}
+    Answer() : value(0.0) {}
+
+    void add_segment(int segment_id, double result) {
+        if (completed_segments.find(segment_id) == completed_segments.end()) {
+            value += result;
+            completed_segments.insert(segment_id);
+        }
+    }
+
+    bool is_complete() {
+        return completed_segments.size() == N_SEGMENTS;
+    }
+
+    double get_value() {
+        return value;
+    }
+};
+
+enum class WorkerState {
+    Disconnected,
+    Connecting,
+    Connected,
+    Busy
+};
+
+class Worker {
+    int id;
+    int sockfd;
+    sockaddr_in addr;
+    WorkerState state;
+    int segment_id;
+    time_t last_attempt;
+
+public:
+    Worker(int id, sockaddr_in address)
+        : id(id), sockfd(-1), addr(address), state(WorkerState::Disconnected), segment_id(-1), last_attempt(0) {}
 
     ~Worker() {
-        if (sockfd != -1) {
-            close(sockfd);
+        close_socket();
+    }
+
+    void update(std::queue<int>& segment_queue) {
+        switch (state) {
+            case WorkerState::Disconnected:
+                std::cout << "Attempting connection to worker " << id << std::endl;
+                attempt_connect();
+                break;
+            case WorkerState::Connecting:
+                std::cout << "Checking connection to worker " << id << std::endl;
+                check_connection();
+                break;
+            case WorkerState::Connected:
+                if (segment_id == -1 && !segment_queue.empty()) {
+                    segment_id = segment_queue.front();
+                    std::cout << "Sending task " << segment_id << " to worker " << id << std::endl;
+                    if (send_task(segment_id)) {
+                        segment_queue.pop();
+                        state = WorkerState::Busy;
+                    } else {
+                        segment_id = -1;
+                    }
+                }
+                break;
+            case WorkerState::Busy:
+                break;
         }
     }
 
-    Worker(const Worker&) = delete;
-    Worker& operator=(const Worker&) = delete;
-
-    Worker(Worker&& other) noexcept
-        : sockfd(other.sockfd), addr(other.addr), available(other.available) {
-        other.sockfd = -1;
+    void handle_event(short revents, std::queue<int>& segment_queue, Answer& answer) {
+        if (revents & POLLIN) {
+            int seg_id;
+            double result;
+            bool disconnect = false;
+            if (receive_result(seg_id, result, disconnect)) {
+                if (seg_id == segment_id) {
+                    answer.add_segment(seg_id, result);
+                }
+                segment_id = -1;
+                state = WorkerState::Connected;
+            } else if (disconnect) {
+                handle_disconnect(segment_queue);
+            }
+        } else if (revents & (POLLHUP | POLLERR | POLLNVAL)) {
+            handle_disconnect(segment_queue);
+        }
     }
 
-    Worker& operator=(Worker&& other) noexcept {
-        if (this != &other) {
+    int get_sockfd() {
+        return sockfd;
+    }
+
+    short get_events() {
+        if (state == WorkerState::Connecting) {
+            return POLLOUT;
+        } else if (state == WorkerState::Busy || state == WorkerState::Connected) {
+            return POLLIN;
+        }
+        return 0;
+    }
+
+private:
+    void attempt_connect() {
+        time_t now = time(nullptr);
+        if (now - last_attempt >= RECONNECT_INTERVAL) {
+            if (initialize_socket()) {
+                state = WorkerState::Connecting;
+            }
+            last_attempt = now;
+        }
+    }
+
+    void check_connection() {
+        int error = 0;
+        socklen_t len = sizeof(error);
+        if (getsockopt(sockfd, SOL_SOCKET, SO_ERROR, &error, &len) < 0 || error != 0) {
             close_socket();
-            sockfd = other.sockfd;
-            addr = other.addr;
-            available = other.available;
-            other.sockfd = -1;
+            state = WorkerState::Disconnected;
+        } else {
+            state = WorkerState::Connected;
         }
-        return *this;
     }
 
     bool initialize_socket() {
         sockfd = socket(AF_INET, SOCK_STREAM, 0);
         if (sockfd < 0) {
-            std::cerr << "Failed to create socket, error: " << strerror(errno) << std::endl;
             return false;
         }
 
@@ -86,7 +190,6 @@ public:
 
         addr.sin_port = htons(WORKER_PORT);
         if (connect(sockfd, (sockaddr *)&addr, sizeof(addr)) < 0 && errno != EINPROGRESS) {
-            std::cerr << "Failed to connect to worker, error: " << strerror(errno) << std::endl;
             close_socket();
             return false;
         }
@@ -96,15 +199,7 @@ public:
 
     bool send_task(int segment_id) {
         ssize_t sent = send(sockfd, &segment_id, sizeof(segment_id), 0);
-        if (sent == sizeof(segment_id)) {
-            std::cout << "Sent task " << segment_id << " to worker " << sockfd << std::endl;
-            available = false;
-            return true;
-        } else if (sent < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
-            std::cerr << "Failed to send task " << segment_id << " to worker " << sockfd << " (error: " << strerror(errno) << ")" << std::endl;
-        }
-        std::cerr << "Failed to send task " << segment_id << " to worker " << sockfd << " (error: " << strerror(errno) << ")" << std::endl;
-        return false;
+        return sent == sizeof(segment_id);
     }
 
     bool receive_result(int &segment_id, double &result, bool &disconnect) {
@@ -116,83 +211,29 @@ public:
         if (received == sizeof(res)) {
             segment_id = res.segment_id;
             result = res.value;
-            available = true;
             return true;
-        } else if (received == 0 || (received < 0 && errno != EAGAIN && errno != EWOULDBLOCK)) {
+        } else if (received <= 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
             disconnect = true;
         }
         return false;
     }
 
-    bool is_disconnected() {
-        if (sockfd == -1) {
-            return true;
+    void handle_disconnect(std::queue<int>& segment_queue) {
+        if (segment_id != -1) {
+            segment_queue.push(segment_id);
+            segment_id = -1;
         }
-        char buf;
-        ssize_t result = recv(sockfd, &buf, 1, MSG_PEEK | MSG_DONTWAIT);
-        if (result == 0) {
-            return true;
-        }
-        if (result < 0) {
-            if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                return false;
-            }
-            if (errno == ECONNRESET || errno == EPIPE || errno == ENOTCONN) {
-                return true;
-            }
-            fprintf(stderr, "Unexpected error in is_disconnected: %s\n", strerror(errno));
-        }
-        return true;
-    }
-
-    bool is_available() {
-        return available;
-    }
-
-    int get_sockfd() {
-        return sockfd;
+        close_socket();
+        state = WorkerState::Disconnected;
     }
 
     void close_socket() {
-        available = false;
-        close(sockfd);
-        sockfd = -1;
-    }
-};
-
-class Asnwer {
-    double value;
-    std::unordered_set<int> completed_segments;
-
-public:
-    Asnwer() : value(0.0) {}
-
-    void add_segment(int segment_id, double result) {
-        if (completed_segments.find(segment_id) == completed_segments.end()) {
-            value += result;
-            completed_segments.insert(segment_id);
+        if (sockfd != -1) {
+            close(sockfd);
+            sockfd = -1;
         }
     }
-
-    bool is_complete() {
-        return completed_segments.size() == N_SEGMENTS;
-    }
-
-    double get_value() {
-        return value;
-    }
 };
-
-void disconnect_client(Worker& worker, std::queue<int>& segment_queue, std::unordered_map<int, int>& worker_to_segment) {
-    std::cout << "Disconnecting worker " << worker.get_sockfd() << std::endl;
-    auto it = worker_to_segment.find(worker.get_sockfd());
-    if (it != worker_to_segment.end()) {
-        int segment_id = it->second;
-        segment_queue.push(segment_id);
-        worker_to_segment.erase(it);
-    }
-    worker.close_socket();
-}
 
 int main() {
     int udp_sock = socket(AF_INET, SOCK_DGRAM, 0);
@@ -205,7 +246,10 @@ int main() {
     broadcast_addr.sin_addr.s_addr = htonl(INADDR_BROADCAST);
 
     const char *message = "HELLO THERE";
-    sendto(udp_sock, message, strlen(message), 0, (sockaddr *)&broadcast_addr, sizeof(broadcast_addr));
+    for (int i = 0; i < BROADCAST_ATTEMPTS; i++) {
+        sendto(udp_sock, message, strlen(message), 0, (sockaddr *)&broadcast_addr, sizeof(broadcast_addr));
+        usleep(BROADCAST_INTERVAL_MILLIS);
+    }
 
     std::vector<Worker> workers;
     pollfd udp_fds[1];
@@ -220,12 +264,10 @@ int main() {
             sockaddr_in worker_addr{};
             socklen_t addr_len = sizeof(worker_addr);
             recvfrom(udp_sock, buffer, BUFFER_SIZE, 0, (sockaddr *)&worker_addr, &addr_len);
-            std::cout << "Received message from worker" << std::endl;
+            std::cout << "Received message from worker " << workers.size() << std::endl;
 
-            Worker worker(worker_addr);
-            if (worker.initialize_socket()) {
-                workers.push_back(std::move(worker));
-            }
+            Worker worker(workers.size(), worker_addr);
+            workers.push_back(std::move(worker));
         }
         ret = poll(udp_fds, 1, discovery_timeout);
     }
@@ -242,79 +284,39 @@ int main() {
         segment_queue.push(i);
     }
 
-    std::unordered_map<int, int> worker_to_segment; // sockfd -> segment_id
-
-    size_t nfds = workers.size();
-    pollfd fds[MAX_FDS];
-    for (size_t i = 0; i < workers.size(); ++i) {
-        fds[i].fd = workers[i].get_sockfd();
-        fds[i].events = POLLIN | POLLHUP | POLLERR;
-    }
-
-    for (size_t i = 0; i < workers.size(); ++i) {
-        if (!segment_queue.empty()) {
-            int segment_id = segment_queue.front();
-            if (workers[i].send_task(segment_id)) {
-                segment_queue.pop();
-                worker_to_segment[workers[i].get_sockfd()] = segment_id;
-            } else {
-                segment_queue.push(segment_id);
-            }
-        }
-    }
-
-    Asnwer answer;
+    Answer answer;
     while (!answer.is_complete()) {
-        ret = poll(fds, nfds, -1);
-        if (ret > 0) {
-            for (size_t i = 0; i < workers.size(); ++i) {
-                if (fds[i].revents & POLLIN) {
-                    int segment_id;
-                    double result_value;
-                    bool disconnect = false;
-                    if (workers[i].receive_result(segment_id, result_value, disconnect)) {
-                        std::cout << "Received result for segment " << segment_id << " from worker " << workers[i].get_sockfd() << std::endl;
-                        answer.add_segment(segment_id, result_value);
-                        worker_to_segment.erase(workers[i].get_sockfd());
-                    } else {
-                        std::cerr << "Failed to receive result from worker " << workers[i].get_sockfd() << std::endl;
-                        if (disconnect) {
-                            disconnect_client(workers[i], segment_queue, worker_to_segment);
-                        }
-                    }
-                } else if (fds[i].revents & (POLLHUP | POLLERR)) {
-                    std::cerr << "Worker " << workers[i].get_sockfd() << " disconnected" << std::endl;
-                    disconnect_client(workers[i], segment_queue, worker_to_segment);
-                } else if (fds[i].revents != 0 && workers[i].get_sockfd() != -1) {
-                    if (fds[i].revents & POLLNVAL) {
-                        std::cerr << "Invalid file descriptor for worker " << workers[i].get_sockfd() << std::endl;
-                        disconnect_client(workers[i], segment_queue, worker_to_segment);
-                    } else {
-                        std::cerr << "Unexpected event " << fds[i].revents << std::endl;
-                        return 1;
-                    }
-                }
-
-                if (workers[i].is_available() && !segment_queue.empty()) {
-                    int segment_id = segment_queue.front();
-                    if (workers[i].send_task(segment_id)) {
-                        segment_queue.pop();
-                        worker_to_segment[workers[i].get_sockfd()] = segment_id;
-                    }
-                }
+        std::vector<pollfd> fds;
+        for (auto& worker : workers) {
+            worker.update(segment_queue);
+            int fd = worker.get_sockfd();
+            if (fd != -1) {
+                pollfd pfd;
+                pfd.fd = fd;
+                pfd.events = worker.get_events();
+                pfd.revents = 0;
+                fds.push_back(pfd);
             }
         }
 
-        bool everyone_disconnected = true;
-        for (size_t i = 0; i < workers.size(); ++i) {
-            if (workers[i].get_sockfd() != -1) {
-                everyone_disconnected = false;
-                break;
-            }
-        }
-        if (everyone_disconnected) {
-            std::cerr << "All workers disconnected, sleeping for 1 second" << std::endl;
+        if (fds.empty()) {
             sleep(1);
+            continue;
+        }
+
+        int ret = poll(fds.data(), fds.size(), POLL_TIMEOUT);
+        if (ret > 0) {
+            std::unordered_map<int, short> events;
+            for (auto& pfd : fds) {
+                events[pfd.fd] = pfd.revents;
+            }
+            for (auto& worker : workers) {
+                int fd = worker.get_sockfd();
+                auto it = events.find(fd);
+                if (it != events.end()) {
+                    worker.handle_event(it->second, segment_queue, answer);
+                }
+            }
         }
     }
 

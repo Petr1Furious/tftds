@@ -12,7 +12,7 @@ services:
       - worker2
       - worker3
 
-  worker1:
+  worker0:
     build:
       context: .
       dockerfile: worker.Dockerfile
@@ -21,7 +21,7 @@ services:
       app-network:
         ipv4_address: 172.16.238.11
 
-  worker2:
+  worker1:
     build:
       context: .
       dockerfile: worker.Dockerfile
@@ -30,7 +30,7 @@ services:
       app-network:
         ipv4_address: 172.16.238.12
 
-  worker3:
+  worker2:
     build:
       context: .
       dockerfile: worker.Dockerfile
