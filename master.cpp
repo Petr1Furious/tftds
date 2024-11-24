@@ -9,6 +9,7 @@
 #include <arpa/inet.h>
 #include <poll.h>
 #include <netinet/tcp.h>
+#include <iomanip>
 
 #ifndef SOCK_NONBLOCK
 #include <fcntl.h>
@@ -105,6 +106,7 @@ public:
             bool disconnect = false;
             if (receive_result(seg_id, result, disconnect)) {
                 if (seg_id == segment_id) {
+                    std::cout << "Received result for segment " << seg_id << " from worker " << id << std::endl;
                     answer.add_segment(seg_id, result);
                 }
                 segment_id = -1;
@@ -144,11 +146,12 @@ private:
     void check_connection() {
         int error = 0;
         socklen_t len = sizeof(error);
-        if (getsockopt(sockfd, SOL_SOCKET, SO_ERROR, &error, &len) < 0 || error != 0) {
+        if (getsockopt(sockfd, SOL_SOCKET, SO_ERROR, &error, &len) < 0) {
             close_socket();
-            state = WorkerState::Disconnected;
-        } else {
+        } else if (error == 0) {
             state = WorkerState::Connected;
+        } else {
+            close_socket();
         }
     }
 
@@ -199,6 +202,9 @@ private:
 
     bool send_task(int segment_id) {
         ssize_t sent = send(sockfd, &segment_id, sizeof(segment_id), 0);
+        if (sent <= 0) {
+            close_socket();
+        }
         return sent == sizeof(segment_id);
     }
 
@@ -224,7 +230,6 @@ private:
             segment_id = -1;
         }
         close_socket();
-        state = WorkerState::Disconnected;
     }
 
     void close_socket() {
@@ -232,6 +237,7 @@ private:
             close(sockfd);
             sockfd = -1;
         }
+        state = WorkerState::Disconnected;
     }
 };
 
@@ -252,11 +258,12 @@ int main() {
     }
 
     std::vector<Worker> workers;
+    std::unordered_set<std::string> worker_addresses;
     pollfd udp_fds[1];
     udp_fds[0].fd = udp_sock;
     udp_fds[0].events = POLLIN;
 
-    int discovery_timeout = 3000;
+    int discovery_timeout = 2000;
     int ret = poll(udp_fds, 1, discovery_timeout);
     while (ret > 0) {
         if (udp_fds[0].revents & POLLIN) {
@@ -264,10 +271,17 @@ int main() {
             sockaddr_in worker_addr{};
             socklen_t addr_len = sizeof(worker_addr);
             recvfrom(udp_sock, buffer, BUFFER_SIZE, 0, (sockaddr *)&worker_addr, &addr_len);
-            std::cout << "Received message from worker " << workers.size() << std::endl;
 
-            Worker worker(workers.size(), worker_addr);
-            workers.push_back(std::move(worker));
+            char ip_str[INET_ADDRSTRLEN];
+            inet_ntop(AF_INET, &(worker_addr.sin_addr), ip_str, sizeof(ip_str));
+            std::string worker_ip = std::string(ip_str) + ":" + std::to_string(ntohs(worker_addr.sin_port));
+
+            if (worker_addresses.find(worker_ip) == worker_addresses.end()) {
+                worker_addresses.insert(worker_ip);
+                Worker worker(workers.size(), worker_addr);
+                workers.push_back(std::move(worker));
+                std::cout << "Added new worker: " << worker_ip << std::endl;
+            }
         }
         ret = poll(udp_fds, 1, discovery_timeout);
     }
@@ -320,6 +334,7 @@ int main() {
         }
     }
 
+    std::cout << std::setprecision(6) << std::fixed;
     std::cout << "Total integral: " << answer.get_value() << std::endl;
 
     return 0;
